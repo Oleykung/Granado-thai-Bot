@@ -1,0 +1,149 @@
+{
+  "timezone": "Asia/Bangkok",
+  "alert_before": [
+    10,
+    5,
+    0
+  ],
+  "bosses": [
+    {
+      "name": "🌍 World Boss",
+      "times": [
+        "02:00",
+        "10:00",
+        "20:00"
+      ],
+      "desc": "บอสโลก - ของแรร์",
+      "color": "FF0000"
+    },
+    {
+      "name": "👑 Buckingham Palace Boss",
+      "times": [
+        "21:00"
+      ],
+      "desc": "บอสวัง",
+      "color": "FFD700"
+    },
+    {
+      "name": "🐯 Saber Tiger",
+      "times": [
+        "09:30",
+        "13:30",
+        "21:30",
+        "00:30"
+      ],
+      "desc": "Field Boss - Ustiur",
+      "color": "FF8C00"
+    },
+    {
+      "name": "👹 Sorakotomi",
+      "times": [
+        "09:30",
+        "13:30",
+        "21:30",
+        "00:30"
+      ],
+      "desc": "Field Boss - Ustiur",
+      "color": "FF8C00"
+    },
+    {
+      "name": "🐊 Butcher Crocodile",
+      "times": [
+        "09:30",
+        "13:30",
+        "21:30"
+      ],
+      "desc": "Field Boss - Katovic",
+      "color": "00BFFF"
+    },
+    {
+      "name": "💀 Shadow Grim Reaper",
+      "times": [
+        "09:30",
+        "13:30",
+        "21:30"
+      ],
+      "desc": "Field Boss - Katovic",
+      "color": "00BFFF"
+    },
+    {
+      "name": "❄️ The Specter of the Avalanche",
+      "times": [
+        "09:30",
+        "13:30",
+        "21:30"
+      ],
+      "desc": "Field Boss - Katovic",
+      "color": "00BFFF"
+    },
+    {
+      "name": "🦫 Elder Capybara",
+      "times": [
+        "11:00",
+        "15:00",
+        "19:00",
+        "23:00"
+      ],
+      "desc": "Field Boss - Gigante",
+      "color": "32CD32"
+    },
+    {
+      "name": "🦇 Vampire Bat Lord",
+      "times": [
+        "11:00",
+        "15:00",
+        "19:00",
+        "23:00"
+      ],
+      "desc": "Field Boss - Gigante",
+      "color": "32CD32"
+    },
+    {
+      "name": "🔥 Hell-Devourer",
+      "times": [
+        "11:00",
+        "15:00",
+        "19:00",
+        "23:00"
+      ],
+      "desc": "Field Boss - Gigante",
+      "color": "32CD32"
+    },
+    {
+      "name": "🗿 Stone Cortes",
+      "times": [
+        "12:00",
+        "18:00",
+        "22:00"
+      ],
+      "desc": "Byron II - Clocktower 2F",
+      "color": "9932CC"
+    },
+    {
+      "name": "🧙‍♀️ Witch of Bondage",
+      "times": [
+        "12:00",
+        "18:00",
+        "22:00"
+      ],
+      "desc": "Boss Byron",
+      "color": "9932CC"
+    },
+    {
+      "name": "⚔️ Louis Arsene III",
+      "times": [
+        "20:30"
+      ],
+      "desc": "Burgundy Palace",
+      "color": "FF1493"
+    },
+    {
+      "name": "💀 Boneless - Raid",
+      "times": [
+        "19:00"
+      ],
+      "desc": "Raid Dungeon Makam",
+      "color": "8B0000"
+    }
+  ]
+}
