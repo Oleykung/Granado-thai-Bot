@@ -1,3 +1,5 @@
 #!/bin/bash
+echo "Installing requirements..."
 pip3 install -r requirements.txt
-python3 bot.py
+echo "Starting GEM Boss Bot TH..."
+python3 main.py

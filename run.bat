@@ -1,4 +1,6 @@
 @echo off
+echo Installing requirements...
 pip install -r requirements.txt
-python bot.py
+echo Starting GEM Boss Bot TH...
+python main.py
 pause

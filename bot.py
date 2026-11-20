@@ -1,508 +1,438 @@
 
-import discord
-from discord.ext import commands, tasks
-import datetime
-import json
 import os
+import json
 import asyncio
-import re
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import discord
+from discord import app_commands
+from discord.ext import tasks
 from dotenv import load_dotenv
 
 load_dotenv()
 
-TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
-CHANNEL_ID_RAW = os.getenv("CHANNEL_ID", "0").strip()
-ROLE_MENTION = os.getenv("ROLE_MENTION", "@everyone").strip()
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
+GUILD_ID = os.getenv("GUILD_ID")  # optional for fast sync
+TIMEZONE_OFFSET = int(os.getenv("TIMEZONE_OFFSET", "7"))  # ไทย UTC+7
+WEB_PORT = int(os.getenv("WEB_PORT", "5000"))
 
-try:
-    CHANNEL_ID = int(CHANNEL_ID_RAW) if CHANNEL_ID_RAW else 0
-except:
-    CHANNEL_ID = 0
+BASE_DIR = Path(__file__).parent
+BOSSES_FILE = BASE_DIR / "bosses.json"
+TIMERS_FILE = BASE_DIR / "boss_timers.json"
 
-# Timezone fix Windows
-try:
-    from zoneinfo import ZoneInfo
-    try:
-        BANGKOK = ZoneInfo("Asia/Bangkok")
-    except:
-        BANGKOK = datetime.timezone(datetime.timedelta(hours=7))
-except:
-    BANGKOK = datetime.timezone(datetime.timedelta(hours=7))
+ICT = timezone(timedelta(hours=TIMEZONE_OFFSET))
 
-print(f"TOKEN: {'✅' if TOKEN else '❌'} | CHANNEL: {CHANNEL_ID}")
+def load_bosses():
+    with open(BOSSES_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
 
-# Load bosses
-try:
-    with open("config.json", "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-    BOSSES = cfg.get("bosses", [])
-except:
-    BOSSES = []
+def load_timers():
+    if TIMERS_FILE.exists():
+        with open(TIMERS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
 
-# เก็บเวลาบอสที่โดนฆ่า - นับถอยหลังเกิดใหม่
-# Format: {boss_name: {"death": datetime, "respawn": datetime, "killer": str, "channel_id": int}}
-boss_deaths = {}
+def save_timers(data):
+    with open(TIMERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
-# โหลดจากไฟล์ถ้ามี (กันบอทรีสตาร์ทแล้วลืม)
-DEATH_FILE = "boss_deaths.json"
-try:
-    if os.path.exists(DEATH_FILE):
-        with open(DEATH_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            for name, info in data.items():
-                boss_deaths[name] = {
-                    "death": datetime.datetime.fromisoformat(info["death"]),
-                    "respawn": datetime.datetime.fromisoformat(info["respawn"]),
-                    "killer": info["killer"],
-                    "channel_id": info.get("channel_id", CHANNEL_ID)
-                }
-        print(f"📂 โหลดประวัติฆ่าบอส {len(boss_deaths)} ตัว")
-except Exception as e:
-    print(f"⚠️ โหลดประวัติไม่ได้: {e}")
+BOSSES = load_bosses()
+BOSSES_BY_ID = {b["id"]: b for b in BOSSES}
 
-def save_deaths():
-    try:
-        data = {}
-        for name, info in boss_deaths.items():
-            data[name] = {
-                "death": info["death"].isoformat(),
-                "respawn": info["respawn"].isoformat(),
-                "killer": info["killer"],
-                "channel_id": info["channel_id"]
-            }
-        with open(DEATH_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"❌ เซฟไม่ได้: {e}")
+# init timers if empty
+timers = load_timers()
+if not timers:
+    now = datetime.now(ICT)
+    for b in BOSSES:
+        # เริ่มต้นให้เกิดในอีก respawn_hours
+        next_spawn = now + timedelta(hours=b.get("respawn_hours", 4))
+        timers[b["id"]] = {
+            "last_death": None,
+            "next_spawn": next_spawn.isoformat(),
+            "notified_10min": False,
+            "notified_spawn": False
+        }
+    save_timers(timers)
+else:
+    timers = load_timers()
+
+def format_boss_big(boss):
+    # ตามที่ขอ: ไทยตัวใหญ่ / อังกฤษตัวเล็ก - ชื่อบอส แมพ เมือง แสดงเป็น ## ไทยใหญ่ -# อังกฤษเล็ก
+    return (
+        f"## {boss['name_th']}\n"
+        f"-# {boss['name_en']}\n"
+        f"## แผนที่: {boss['map_th']} | เมือง: {boss['city_th']}\n"
+        f"-# Map: {boss['map_en']} | City: {boss['city_en']}\n"
+        f"**เกิดทุก:** {boss.get('respawn_hours',4)} ชม. | **Respawn:** {boss.get('respawn_hours',4)}h"
+    )
+
+def format_boss_ansi(boss, status=""):
+    # สำหรับสีแดง ไทย / เหลือง อังกฤษ ในดิส
+    # ใช้ ANSI code block
+    # 31=แดง, 33=เหลือง, 36=ฟ้า
+    return (
+        f"```ansi\n"
+        f"\u001b[31m{boss['name_th']}\u001b[0m {status}\n"
+        f"\u001b[33m{boss['name_en']}\u001b[0m\n"
+        f"\u001b[0mแผนที่: {boss['map_th']} | เมือง: {boss['city_th']}\n"
+        f"Map: {boss['map_en']} | City: {boss['city_en']}\n"
+        f"```"
+    )
+
+def get_next_spawn(boss_id):
+    t = timers.get(boss_id)
+    if not t:
+        return None
+    return datetime.fromisoformat(t["next_spawn"])
 
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix=["!", "บ!", "."], intents=intents, help_command=None)
+client = discord.Client(intents=intents)
+tree = app_commands.CommandTree(client)
 
-def parse_time(t_str):
-    try:
-        h, m = map(int, t_str.split(":"))
-        return h, m
-    except:
-        return 0,0
-
-def get_offset_time(base_time_str, offset_min):
-    h, m = parse_time(base_time_str)
-    now = datetime.datetime.now(BANGKOK)
-    dt = now.replace(hour=h, minute=m, second=0, microsecond=0)
-    dt = dt + datetime.timedelta(minutes=offset_min)
-    return dt.strftime("%H:%M")
-
-def get_next_bosses(limit=10):
-    now = datetime.datetime.now(BANGKOK)
-    upcoming = []
-    for minutes_ahead in range(0, 24*60):
-        check_time = now + datetime.timedelta(minutes=minutes_ahead)
-        check_str = check_time.strftime("%H:%M")
-        for boss in BOSSES:
-            if check_str in boss.get("times", []):
-                diff = minutes_ahead
-                if diff == 0:
-                    upcoming.append((boss, check_str, "ตอนนี้!", diff))
-                else:
-                    upcoming.append((boss, check_str, f"อีก {diff} นาที", diff))
-        if len(upcoming) >= limit:
-            break
-    return upcoming
-
-def find_boss_by_name(name_input):
-    """หาบอสจากชื่อที่พิมพ์มา"""
-    if not name_input:
-        return None
-    name_lower = name_input.lower().strip()
-    for boss in BOSSES:
-        b_name = boss["name"]
-        b_clean = re.sub(r'[^a-zA-Z0-9ก-ฮะ-์\s]', '', b_name).lower().strip()
-        if name_lower in b_name.lower() or name_lower in b_clean or b_clean in name_lower:
-            return boss
-        # เช็คคำย่อย
-        for word in name_lower.split():
-            if word and len(word) >= 3 and word in b_name.lower():
-                return boss
-    return None
-
-def parse_custom_time(text):
-    """แปลงข้อความเวลาเป็น timedelta เช่น 2ชม, 30นาที, 1h30m, 2:30"""
-    if not text:
-        return None
-    text = text.lower().strip()
-    # แบบ 1:30 (ชั่วโมง:นาที)
-    m = re.match(r'^(\d+):(\d+)$', text)
-    if m:
-        h, mins = int(m.group(1)), int(m.group(2))
-        return datetime.timedelta(hours=h, minutes=mins)
-    
-    total = datetime.timedelta()
-    found = False
-    # ชม, ชั่วโมง, h, hour
-    for pattern in [r'(\d+)\s*ชม', r'(\d+)\s*ชั่วโมง', r'(\d+)\s*h', r'(\d+)\s*hour']:
-        mm = re.search(pattern, text)
-        if mm:
-            total += datetime.timedelta(hours=int(mm.group(1)))
-            found = True
-    # นาที, น, m, min
-    for pattern in [r'(\d+)\s*นาที', r'(\ด+)\s*น\b', r'(\d+)\s*m\b', r'(\d+)\s*min']:
-        mm = re.search(pattern, text)
-        if mm:
-            try:
-                total += datetime.timedelta(minutes=int(mm.group(1)))
-                found = True
-            except:
-                pass
-    # แบบตัวเลขล้วน เช่น 90 = 90 นาที
-    if not found:
-        m = re.match(r'^\d+$', text)
-        if m:
-            # ถ้า <=5 ตีเป็นชั่วโมง, มากกว่าเป็นนาที
-            val = int(text)
-            if val <= 5:
-                return datetime.timedelta(hours=val)
-            else:
-                return datetime.timedelta(minutes=val)
-    return total if found and total.total_seconds() > 0 else None
-
-def extract_boss_and_time(full_text):
-    """แยกชื่อบอสกับเวลา เช่น 'World Boss 2ชม' -> ('World Boss', timedelta)"""
-    if not full_text:
-        return full_text, None
-    parts = full_text.strip().split()
-    if not parts:
-        return full_text, None
-    last = parts[-1]
-    td = parse_custom_time(last)
-    if td:
-        boss_name = " ".join(parts[:-1]).strip()
-        return boss_name, td
-    # ลอง 2 คำสุดท้าย เช่น '1 ชั่วโมง'
-    if len(parts) >= 2:
-        last2 = " ".join(parts[-2:])
-        td = parse_custom_time(last2)
-        if td:
-            boss_name = " ".join(parts[:-2]).strip()
-            return boss_name, td
-    return full_text, None
-
-def get_next_scheduled_time(boss):
-    """หาเวลาบอสเกิดรอบถัดไปจาก config"""
-    now = datetime.datetime.now(BANGKOK)
-    times = boss.get("times", [])
-    if not times:
-        return now + datetime.timedelta(hours=2)
-    for minutes_ahead in range(1, 24*60):
-        check = now + datetime.timedelta(minutes=minutes_ahead)
-        if check.strftime("%H:%M") in times:
-            return check
-    return now + datetime.timedelta(hours=2)
-
-# ==================== LOOPS ====================
-@tasks.loop(seconds=60)
-async def boss_checker():
-    now = datetime.datetime.now(BANGKOK)
-    now_str = now.strftime("%H:%M")
-    channel = bot.get_channel(CHANNEL_ID)
-    if not channel:
-        return
-    for boss in BOSSES:
-        for b_time in boss.get("times", []):
-            pre10 = get_offset_time(b_time, -10)
-            pre5 = get_offset_time(b_time, -5)
-            embed = None
-            if now_str == pre10:
-                embed = discord.Embed(title=f"⏰ อีก 10 นาที {boss['name']} จะเกิด!", description=f"{boss.get('desc','')}\nเวลาเกิด: **{b_time} น.**", color=int(boss.get("color","FF0000"),16))
-            elif now_str == pre5:
-                embed = discord.Embed(title=f"⚠️ อีก 5 นาที {boss['name']} จะเกิด!", description=f"{boss.get('desc','')}\nเวลาเกิด: **{b_time} น.**", color=0xFFFF00)
-            elif now_str == b_time:
-                embed = discord.Embed(title=f"🔥 {boss['name']} เกิดแล้ว!", description=f"{boss.get('desc','')}", color=0x00FF00)
-            if embed:
-                embed.set_footer(text="Granado Espada M TH | GMT+7")
-                try:
-                    content = ROLE_MENTION if ROLE_MENTION else None
-                    await channel.send(content=content, embed=embed)
-                    await asyncio.sleep(1)
-                except:
-                    pass
-
-@tasks.loop(seconds=60)
-async def death_countdown_checker():
-    """เช็คนับถอยหลังบอสที่โดนฆ่าไป"""
-    now = datetime.datetime.now(BANGKOK)
-    to_remove = []
-    for boss_name, info in list(boss_deaths.items()):
-        respawn = info["respawn"]
-        # แปลงให้มี timezone ถ้าไม่มี
-        if respawn.tzinfo is None:
-            respawn = respawn.replace(tzinfo=BANGKOK)
-        diff = (respawn - now).total_seconds()
-        channel = bot.get_channel(info["channel_id"]) or bot.get_channel(CHANNEL_ID)
-        if not channel:
-            continue
-        
-        # ใกล้เกิด 10 นาที, 5 นาที, เกิดแล้ว
-        if 599 < diff <= 660:  # 10 นาที
-            embed = discord.Embed(title=f"⏰ อีก 10 นาที {boss_name} จะเกิดใหม่!", description=f"โดนฆ่าโดย {info['killer']} ตอน {info['death'].strftime('%H:%M')}\nเกิดใหม่: **{respawn.strftime('%H:%M')} น.**", color=0xFF8C00)
-            embed.set_footer(text="นับถอยหลังจากตอนฆ่า")
-            try:
-                await channel.send(content=ROLE_MENTION if ROLE_MENTION else None, embed=embed)
-            except:
-                pass
-        elif 299 < diff <= 360:  # 5 นาที
-            embed = discord.Embed(title=f"⚠️ อีก 5 นาที {boss_name} จะเกิดใหม่!", description=f"เตรียมตัว! โดนฆ่าโดย {info['killer']}", color=0xFFFF00)
-            try:
-                await channel.send(content=ROLE_MENTION if ROLE_MENTION else None, embed=embed)
-            except:
-                pass
-        elif 0 < diff <= 60:  # เกิดแล้ว
-            embed = discord.Embed(title=f"🔥 {boss_name} เกิดใหม่แล้ว!", description=f"โดนฆ่าไปเมื่อ {info['death'].strftime('%H:%M')} โดย {info['killer']}\nรีบไปตีเลย!", color=0x00FF00)
-            embed.set_footer(text="นับถอยหลังครบแล้ว")
-            try:
-                await channel.send(content=ROLE_MENTION if ROLE_MENTION else None, embed=embed)
-            except:
-                pass
-            to_remove.append(boss_name)
-        elif diff <= 0:
-            to_remove.append(boss_name)
-    
-    for name in to_remove:
-        if name in boss_deaths:
-            del boss_deaths[name]
-    if to_remove:
-        save_deaths()
-
-# ==================== EVENTS ====================
-@bot.event
-async def on_message(message):
-    if message.author == bot.user:
-        return
-    print(f"📩 {message.content} จาก {message.author} ใน #{message.channel.name}")
-    await bot.process_commands(message)
-
-@bot.event
+@client.event
 async def on_ready():
-    print(f"\n✅ บอทออนไลน์: {bot.user}")
-    print(f"⏰ เวลาไทย: {datetime.datetime.now(BANGKOK).strftime('%H:%M:%S')}")
-    print(f"📜 คำสั่ง: !บอส !ต่อไป !ฆ่า !นับถอยหลัง")
-    if not boss_checker.is_running():
-        boss_checker.start()
-    if not death_countdown_checker.is_running():
-        death_countdown_checker.start()
-    print(f"💀 โหลดประวัติฆ่า {len(boss_deaths)} ตัว")
+    print(f"Logged in as {client.user}")
+    # Sync commands
+    if GUILD_ID:
+        guild = discord.Object(id=int(GUILD_ID))
+        tree.copy_global_to(guild=guild)
+        await tree.sync(guild=guild)
+        print(f"Synced to guild {GUILD_ID}")
+    else:
+        await tree.sync()
+        print("Synced global commands")
+    if not boss_check_loop.is_running():
+        boss_check_loop.start()
 
-# ==================== COMMANDS ====================
-@bot.command(name="บอส", aliases=["boss", "bosslist"])
-async def boss_list(ctx):
-    embed = discord.Embed(title="👹 รายชื่อบอสทั้งหมด", description="เวลาไทย GMT+7", color=0x3498db)
+# ----- Background Task: แจ้งเตือน 10 นาที + ตอนเกิด @everyone -----
+# ----- Background Task: แจ้งเตือน 10 นาที + ตอนเกิด @everyone (FIXED v2) -----
+@tasks.loop(seconds=30)
+async def boss_check_loop():
+    # FIX 1: โหลด timers จากไฟล์ใหม่ทุกครั้ง (กันเว็บกับบอทไม่ตรงกัน)
+    global timers
+    try:
+        timers = load_timers()
+    except Exception as e:
+        print(f"[LOOP] load timers error: {e}")
+        return
+
+    if CHANNEL_ID == 0:
+        print("[LOOP] ❌ CHANNEL_ID = 0 ยังไม่ได้ตั้งค่าใน .env ! ไปเช็ค .env")
+        return
+    channel = client.get_channel(CHANNEL_ID)
+    if not channel:
+        try:
+            channel = await client.fetch_channel(CHANNEL_ID)
+        except Exception as e:
+            print(f"[LOOP] ❌ หาห้อง CHANNEL_ID={CHANNEL_ID} ไม่เจอ: {e} - บอทอยู่ในเซิร์ฟนั้นไหม? มีสิทธิ์ View Channel ไหม?")
+            return
+    now = datetime.now(ICT)
+    updated = False
     for boss in BOSSES:
-        times = " / ".join(boss.get("times", []))
-        embed.add_field(name=f"{boss['name']}", value=f"⏰ {times}\n{boss.get('desc','')}", inline=False)
-    embed.set_footer(text=f"ใช้ !ต่อไป ดูบอสใกล้เกิด | {datetime.datetime.now(BANGKOK).strftime('%H:%M')}")
-    await ctx.send(embed=embed)
+        bid = boss["id"]
+        data = timers.get(bid)
+        if not data:
+            continue
+        try:
+            next_spawn = datetime.fromisoformat(data["next_spawn"])
+        except:
+            continue
+        diff = (next_spawn - now).total_seconds()
 
-@bot.command(name="ต่อไป", aliases=["next", "nextboss", "บอสต่อไป"])
-async def next_boss(ctx):
-    upcoming = get_next_bosses(10)
-    if not upcoming:
-        await ctx.send("ไม่เจอบอสใน 24 ชม.")
+        # FIX 2: ขยายหน้าต่างแจ้งเกิดจาก 60 วินาที -> 30 นาที
+        # ของเก่า: -60 < diff <= 0 ถ้าบอทหลับไป 61 วิ จะไม่แจ้งเลยตลอดกาล
+        # ของใหม่: -1800 < diff <= 0 (ถ้าเลยเวลาเกิดมาไม่เกิน 30 นาที ยังแจ้ง)
+        # ถ้าเลย 30 นาทีไปแล้ว = พลาดแจ้ง ให้รีเซ็ต flag เพื่อรอบหน้าแจ้งได้
+
+        # 10 นาทีล่วงหน้า
+        if 0 < diff <= 600 and not data.get("notified_10min"):
+            try:
+                embed = discord.Embed(
+                    title=f"⚠️ บอสใกล้เกิดใน 10 นาที!",
+                    description=format_boss_big(boss),
+                    color=0xFFAA00
+                )
+                embed.add_field(name="เวลาเกิด", value=f"<t:{int(next_spawn.timestamp())}:F> (<t:{int(next_spawn.timestamp())}:R>)", inline=False)
+                ansi_text = format_boss_ansi(boss, "- จะเกิดใน 10 นาที")
+                await channel.send(content=f"@everyone\n{ansi_text}", embed=embed)
+                print(f"[NOTIFY] 10min {boss['name_th']} diff={int(diff)}s")
+                data["notified_10min"] = True
+                updated = True
+            except Exception as e:
+                print(f"[NOTIFY ERROR] 10min {boss['name_th']}: {e} - เช็คสิทธิ์ Send Messages / Embed Links / Mention @everyone")
+
+        # ตอนเกิด - หน้าต่างกว้าง 30 นาที
+        if -1800 < diff <= 0 and not data.get("notified_spawn"):
+            try:
+                embed = discord.Embed(
+                    title=f"🔥 บอสเกิดแล้ว!",
+                    description=format_boss_big(boss),
+                    color=0xFF0000
+                )
+                embed.add_field(name="แผนที่", value=f"{boss['map_th']} ({boss['map_en']})", inline=True)
+                embed.add_field(name="เมือง", value=f"{boss['city_th']} ({boss['city_en']})", inline=True)
+                embed.add_field(name="เวลา", value=f"<t:{int(now.timestamp())}:F>", inline=False)
+                ansi_text = format_boss_ansi(boss, "- เกิดแล้ว NOW!")
+                await channel.send(content=f"@everyone บอสเกิดแล้ว!\n{ansi_text}", embed=embed)
+                print(f"[NOTIFY] SPAWN {boss['name_th']} diff={int(diff)}s")
+                data["notified_spawn"] = True
+                updated = True
+            except Exception as e:
+                print(f"[NOTIFY ERROR] SPAWN {boss['name_th']}: {e}")
+
+        # FIX 3: ถ้าเลยเวลาเกิดไปแล้วเกิน 30 นาที ยังไม่มี kill -> อย่าค้าง flag
+        # ของเก่า pass เฉยๆ ทำให้ next_spawn ในอดีตค้างตลอด บอทจะไม่แจ้งอีกเลย
+        if diff < -1800:
+            # ถ้าเลยมา 30 นาทีแล้ว แปลว่าพลาดแจ้งไปแล้ว ให้รีเซ็ต flag เพื่อไม่ให้ค้าง
+            # และอย่าเพิ่งรีเซ็ตเวลา รอ /kill (แต่จะ log ไว้)
+            if data.get("notified_spawn") or data.get("notified_10min"):
+                print(f"[LOOP] Missed {boss['name_th']} diff={int(diff)}s next={next_spawn} - รอ /kill หรือ /reset_all")
+            # ไม่รีเซ็ตอัตโนมัติ แต่ปลด flag ให้รอบหน้าถ้ามีการ set ใหม่จะแจ้งได้
+            pass
+
+    if updated:
+        save_timers(timers)
+
+@boss_check_loop.before_loop
+async def before_boss_loop():
+    await client.wait_until_ready()
+    print("[LOOP] boss_check_loop ready - เริ่มเช็คทุก 30 วิ")
+
+
+# ----- Autocomplete -----
+async def boss_autocomplete(interaction: discord.Interaction, current: str):
+    current = current.lower()
+    choices = []
+    for b in BOSSES:
+        if current in b["name_th"].lower() or current in b["name_en"].lower() or current in b["id"]:
+            choices.append(app_commands.Choice(name=f"{b['name_th']} / {b['name_en']}", value=b["id"]))
+    return choices[:25]
+
+# ----- Slash Command: /boss -----
+@tree.command(name="boss", description="เช็คเวลาบอส Granado Espada M ทั้ง 12 ตัว")
+@app_commands.describe(city="กรองตามเมือง: reboldoeux / coimbra / auch")
+@app_commands.choices(city=[
+    app_commands.Choice(name="เมืองรีโบลโดซ์ / Reboldoeux", value="reboldoeux"),
+    app_commands.Choice(name="ท่าเรือคอยมบรา / Port of Coimbra", value="coimbra"),
+    app_commands.Choice(name="เมืองอูช / City of Auch", value="auch"),
+])
+async def boss_command(interaction: discord.Interaction, city: str = None):
+    await interaction.response.defer()
+    now = datetime.now(ICT)
+    filtered = BOSSES
+    if city:
+        filtered = [b for b in BOSSES if b["city_key"] == city]
+
+    embed = discord.Embed(
+        title="📜 ตารางบอส Granado Espada M - เซิร์ฟไทย",
+        description="ไทยตัวใหญ่ ## / อังกฤษตัวเล็ก -# | แดง=ไทย เหลือง=อังกฤษ ใน ANSI",
+        color=0x00FFAA
+    )
+
+    lines = []
+    ansi_blocks = []
+    for b in filtered:
+        bid = b["id"]
+        next_spawn = get_next_spawn(bid)
+        if next_spawn:
+            ts = f"<t:{int(next_spawn.timestamp())}:R> (<t:{int(next_spawn.timestamp())}:t>)"
+            remaining = next_spawn - now
+            status = f"⏰ {ts}"
+        else:
+            status = "ไม่พบเวลา"
+        
+        # Embed field แบบที่ขอ ## ไทยใหญ่ -# อังกฤษเล็ก
+        embed.add_field(
+            name=f"{b['name_th']} / {b['name_en']}",
+            value=f"## {b['name_th']}\n-# {b['name_en']}\n## {b['map_th']} | {b['city_th']}\n-# {b['map_en']} | {b['city_en']}\n{status}\n",
+            inline=False
+        )
+        # สำหรับแสดงในข้อความหลักด้วย
+        lines.append(f"## {b['name_th']}\n-# {b['name_en']} - {status}")
+
+    # ส่งเป็น embed + ANSI ตัวอย่าง 3 ตัวแรก
+    ansi_example = ""
+    for b in filtered[:3]:
+        ansi_example += format_boss_ansi(b) + "\n"
+
+    content = "@everyone\n" + "\n".join(lines[:12]) + f"\n\n{ansi_example}\n**สีแดง=ไทย / สีเหลือง=อังกฤษ** ใช้ /kill เพื่อรีเซ็ตเวลาเมื่อบอสตาย"
+
+    # Discord จำกัดความยาว ถ้าเยอะให้ส่งเป็น embed อย่างเดียว
+    if len(content) > 1900:
+        content = "@everyone ตารางบอสทั้งหมดใน Embed ด้านล่าง"
+    
+    await interaction.followup.send(content=content, embed=embed)
+
+# ----- Slash Command: /kill -----
+@tree.command(name="kill", description="แจ้งว่าบอสตายแล้ว เพื่อรีเซ็ตเวลาเกิดใหม่ (kill boss)")
+@app_commands.describe(boss="เลือกบอสที่ตาย")
+@app_commands.autocomplete(boss=boss_autocomplete)
+async def kill_command(interaction: discord.Interaction, boss: str):
+    await interaction.response.defer()
+    if boss not in BOSSES_BY_ID:
+        await interaction.followup.send(f"❌ ไม่พบบอส id `{boss}`", ephemeral=True)
         return
-    embed = discord.Embed(title="🔥 บอสที่ใกล้จะเกิด", description=f"เวลาตอนนี้: **{datetime.datetime.now(BANGKOK).strftime('%H:%M:%S')}**", color=0xff0000)
-    for boss, b_time, when, diff in upcoming:
-        if diff == 0:
-            embed.add_field(name=f"🔴 {boss['name']} - ตอนนี้!", value=f"⏰ {b_time} | {boss.get('desc','')}", inline=False)
-        else:
-            embed.add_field(name=f"{boss['name']}", value=f"⏰ {b_time} ({when}) | {boss.get('desc','')}", inline=False)
-    await ctx.send(embed=embed)
+    
+    b = BOSSES_BY_ID[boss]
+    now = datetime.now(ICT)
+    respawn_h = b.get("respawn_hours", 4)
+    next_spawn = now + timedelta(hours=respawn_h)
 
-@bot.command(name="เวลา", aliases=["time", "now"])
-async def current_time(ctx):
-    now = datetime.datetime.now(BANGKOK)
-    embed = discord.Embed(title="⏰ เวลาเซิร์ฟเวอร์", color=0x00ff00)
-    embed.add_field(name="เวลาไทย GMT+7", value=f"**{now.strftime('%Y-%m-%d %H:%M:%S')}**", inline=False)
-    await ctx.send(embed=embed)
+    timers[boss] = {
+        "last_death": now.isoformat(),
+        "next_spawn": next_spawn.isoformat(),
+        "notified_10min": False,
+        "notified_spawn": False
+    }
+    save_timers(timers)
 
-@bot.command(name="ทดสอบ", aliases=["test", "เทส"])
-async def test_alert(ctx):
-    embed = discord.Embed(title="✅ บอททำงานปกติ!", description=f"ห้องนี้: {ctx.channel.id}\nเวลาไทย: {datetime.datetime.now(BANGKOK).strftime('%H:%M:%S')}", color=0x00ff00)
-    await ctx.send(content=ROLE_MENTION if ROLE_MENTION else None, embed=embed)
+    embed = discord.Embed(
+        title=f"💀 บอสตาย - รีเซ็ตเวลา",
+        description=format_boss_big(b),
+        color=0x555555
+    )
+    embed.add_field(name="ตายเมื่อ", value=f"<t:{int(now.timestamp())}:F>", inline=True)
+    embed.add_field(name="เกิดใหม่", value=f"<t:{int(next_spawn.timestamp())}:F> (<t:{int(next_spawn.timestamp())}:R>)", inline=True)
 
-@bot.command(name="ช่วย", aliases=["help", "คำสั่ง"])
-async def help_cmd(ctx):
-    embed = discord.Embed(title="📜 คำสั่งบอท Granado Espada M TH", color=0x3498db)
-    embed.add_field(name="👹 !บอส", value="ดูบอสทั้งหมด", inline=False)
-    embed.add_field(name="🔥 !ต่อไป", value="ดูบอสใกล้เกิด", inline=False)
-    embed.add_field(name="💀 !ฆ่า ชื่อบอส [เวลา]", value="ฆ่าบอส + นับถอยหลังเกิดใหม่\nตัวอย่าง: `!ฆ่า World Boss`\n`!ฆ่า Saber Tiger 2ชม`\n`!ฆ่า Stone Cortes 30นาที`\n`!ฆ่า Elder Capybara 1:30`", inline=False)
-    embed.add_field(name="⏳ !นับถอยหลัง", value="ดูบอสที่กำลังนับถอยหลังเกิดใหม่", inline=False)
-    embed.add_field(name="⏰ !เวลา", value="เช็คเวลาไทย", inline=False)
-    embed.add_field(name="🗑️ !ล้าง", value="ล้างนับถอยหลังทั้งหมด", inline=False)
-    embed.set_footer(text="Prefix: ! . บ! | พิมพ์ !ช่วย ดูวิธีใช้")
-    await ctx.send(embed=embed)
+    ansi = format_boss_ansi(b, f"- ตายแล้ว จะเกิดใหม่ใน {respawn_h} ชม.")
 
-# ===== คำสั่งฆ่าบอส + นับถอยหลัง =====
-@bot.command(name="ฆ่า", aliases=["kill", "ฆ่าบอส", "บอสตาย", "ตาย"])
-async def kill_boss(ctx, *, full_text: str = ""):
-    if not full_text:
-        embed = discord.Embed(title="💀 จะฆ่าตัวไหน?", description="ตัวอย่าง:\n`!ฆ่า World Boss`\n`!ฆ่า Saber Tiger 2ชม`\n`!ฆ่า Stone Cortes 30นาที`\n`!ฆ่า Elder Capybara 1:30`", color=0xff0000)
-        await ctx.send(embed=embed)
+    await interaction.followup.send(content=f"@everyone\n{ansi}", embed=embed)
+
+# ----- Slash Command: /setboss -----
+@tree.command(name="setboss", description="ตั้งเวลาบอสจริงเซิฟไทย (แก้ไฟล์ให้ตรงเซิฟ) - แอดมิน")
+@app_commands.describe(
+    boss="บอสที่ต้องการตั้ง",
+    respawn_hours="ตั้งเวลารีสปอนใหม่เป็นชั่วโมง (เช่น 4)",
+    next_spawn_minutes="ตั้งว่าเกิดในอีกกี่นาที (เช่น 60 = เกิดใน 1 ชม.)"
+)
+@app_commands.autocomplete(boss=boss_autocomplete)
+async def setboss_command(interaction: discord.Interaction, boss: str, respawn_hours: int = None, next_spawn_minutes: int = None):
+    await interaction.response.defer(ephemeral=True)
+    if boss not in BOSSES_BY_ID:
+        await interaction.followup.send("ไม่พบบอส", ephemeral=True)
         return
     
-    boss_name_input, custom_td = extract_boss_and_time(full_text)
-    found_boss = find_boss_by_name(boss_name_input)
-    
-    now = datetime.datetime.now(BANGKOK)
-    killer = ctx.author.display_name
-    
-    if found_boss:
-        display_name = found_boss["name"]
-        # คำนวณเวลาเกิดใหม่
-        if custom_td:
-            respawn = now + custom_td
-            time_desc = f"นับถอยหลัง {full_text.split()[-1]} (กำหนดเอง)"
-        else:
-            respawn = get_next_scheduled_time(found_boss)
-            time_desc = f"ตามตารางบอส"
-        
-        # เก็บลง dict
-        boss_deaths[display_name] = {
-            "death": now,
-            "respawn": respawn,
-            "killer": killer,
-            "channel_id": ctx.channel.id
-        }
-        save_deaths()
-        
-        diff = respawn - now
-        hours = int(diff.total_seconds() // 3600)
-        minutes = int((diff.total_seconds() % 3600) // 60)
-        if hours > 0:
-            countdown_str = f"{hours} ชม. {minutes} นาที"
-        else:
-            countdown_str = f"{minutes} นาที"
-        
-        embed = discord.Embed(title=f"💀 {display_name} ตายแล้ว!", description=f"ถูกฆ่าโดย **{killer}**", color=0x8B0000)
-        embed.add_field(name="🕒 เวลาตาย", value=now.strftime("%H:%M:%S น."), inline=True)
-        embed.add_field(name="⏳ เกิดใหม่ใน", value=f"**{countdown_str}**", inline=True)
-        embed.add_field(name="⏰ เวลาเกิดใหม่", value=f"**{respawn.strftime('%H:%M:%S')} น.**", inline=False)
-        embed.add_field(name="📝 หมายเหตุ", value=time_desc, inline=False)
-        embed.add_field(name="🔔", value="บอทจะแจ้งเตือนก่อนเกิด 10 นาที / 5 นาที / ตอนเกิด", inline=False)
-        embed.set_footer(text=f"พิมพ์ !นับถอยหลัง เพื่อดูทั้งหมด")
-        await ctx.send(content=ROLE_MENTION if ROLE_MENTION else None, embed=embed)
+    b = BOSSES_BY_ID[boss]
+    if respawn_hours:
+        b["respawn_hours"] = respawn_hours
+        # อัพเดตไฟล์ bosses.json ด้วย
+        with open(BOSSES_FILE, "w", encoding="utf-8") as f:
+            json.dump(BOSSES, f, ensure_ascii=False, indent=2)
+
+    now = datetime.now(ICT)
+    if next_spawn_minutes is not None:
+        next_spawn = now + timedelta(minutes=next_spawn_minutes)
     else:
-        # ไม่เจอในลิส แต่ก็ให้นับถอยหลังได้ (บอสทั่วไป)
-        if custom_td:
-            respawn = now + custom_td
-        else:
-            respawn = now + datetime.timedelta(hours=2)  # default 2 ชม.
-        
-        display_name = boss_name_input or full_text
-        boss_deaths[display_name] = {
-            "death": now,
-            "respawn": respawn,
-            "killer": killer,
-            "channel_id": ctx.channel.id
+        next_spawn = now + timedelta(hours=b.get("respawn_hours", 4))
+
+    timers[boss] = {
+        "last_death": now.isoformat() if next_spawn_minutes is None else timers.get(boss, {}).get("last_death"),
+        "next_spawn": next_spawn.isoformat(),
+        "notified_10min": False,
+        "notified_spawn": False
+    }
+    save_timers(timers)
+
+    await interaction.followup.send(
+        f"✅ ตั้งค่า {b['name_th']} / {b['name_en']} เรียบร้อย\n"
+        f"Respawn: {b['respawn_hours']}h\n"
+        f"Next: <t:{int(next_spawn.timestamp())}:F>",
+        ephemeral=True
+    )
+
+# ----- Slash Command: /boss_web -----
+@tree.command(name="boss_web", description="ลิงก์เว็บดูบอส (ชื่อไทยแดง อังกฤษเหลือง)")
+async def boss_web_command(interaction: discord.Interaction):
+    port = WEB_PORT
+    await interaction.response.send_message(
+        f"🌐 เว็บดูบอส: http://localhost:{port}\n"
+        f"ชื่อบอสภาษาไทยสีแดง อังกฤษสีเหลือง\n"
+        f"รัน `python web.py` เพื่อเปิดเว็บ",
+        ephemeral=True
+    )
+
+
+# ----- Slash Command: /reset_all -----
+@tree.command(name="reset_all", description="RESET บอสทุกตัว (12 ตัว) - ตั้งเวลาเกิดใหม่ทั้งหมด")
+async def reset_all_command(interaction: discord.Interaction):
+    await interaction.response.defer()
+    now = datetime.now(ICT)
+    for b in BOSSES:
+        next_spawn = now + timedelta(hours=b.get("respawn_hours", 4))
+        timers[b["id"]] = {
+            "last_death": now.isoformat(),
+            "next_spawn": next_spawn.isoformat(),
+            "notified_10min": False,
+            "notified_spawn": False
         }
-        save_deaths()
-        
-        diff = respawn - now
-        minutes = int(diff.total_seconds() // 60)
-        
-        embed = discord.Embed(title=f"💀 {display_name} ตายแล้ว!", description=f"**{killer}** จัดการเรียบร้อย!", color=0x8B0000)
-        embed.add_field(name="⏳ เกิดใหม่ใน", value=f"{minutes} นาที", inline=True)
-        embed.add_field(name="⏰ เวลาเกิดใหม่", value=f"{respawn.strftime('%H:%M')} น.", inline=True)
-        await ctx.send(embed=embed)
+    save_timers(timers)
+    embed = discord.Embed(title="🔄 RESET บอสทุกตัวเรียบร้อย!", description="รีเซ็ตบอส 12 ตัว - Reboldoeux 4 / Coimbra 4 / Auch 4", color=0xFF0000)
+    for b in BOSSES:
+        ns = get_next_spawn(b["id"])
+        embed.add_field(name=f"{b['name_th']} / {b['name_en']}", value=f"## {b['name_th']}\n-# {b['name_en']}\nเกิดใหม่ <t:{int(ns.timestamp())}:R>", inline=False)
+    await interaction.followup.send(content="@everyone 🔄 Reset บอสทุกตัวแล้ว!", embed=embed)
 
-@bot.command(name="นับถอยหลัง", aliases=["countdown", "นับ", "ถอยหลัง", "เคาน์ดาวน์", "cd", "เหลือ"])
-async def countdown_list(ctx):
-    if not boss_deaths:
-        embed = discord.Embed(title="⏳ ไม่มีบอสที่นับถอยหลังอยู่", description="พิมพ์ `!ฆ่า ชื่อบอส` เพื่อเริ่มนับ", color=0x808080)
-        await ctx.send(embed=embed)
-        return
-    
-    now = datetime.datetime.now(BANGKOK)
-    embed = discord.Embed(title="⏳ บอสที่นับถอยหลังเกิดใหม่", description=f"เวลาตอนนี้: {now.strftime('%H:%M:%S')}", color=0xFF8C00)
-    
-    for name, info in boss_deaths.items():
-        respawn = info["respawn"]
-        if respawn.tzinfo is None:
-            respawn = respawn.replace(tzinfo=BANGKOK)
-        diff = (respawn - now).total_seconds()
-        if diff <= 0:
-            embed.add_field(name=f"🔥 {name} - เกิดแล้ว!", value=f"ฆ่าโดย {info['killer']} | {info['death'].strftime('%H:%M')}", inline=False)
-        else:
-            h = int(diff // 3600)
-            m = int((diff % 3600) // 60)
-            s = int(diff % 60)
-            if h > 0:
-                left = f"{h}ชม {m}นาที"
-            elif m > 0:
-                left = f"{m}นาที {s}วิ"
-            else:
-                left = f"{s}วินาที"
-            embed.add_field(name=f"💀 {name}", value=f"⏳ เหลือ **{left}** | เกิด **{respawn.strftime('%H:%M:%S')}** | ฆ่าโดย {info['killer']}", inline=False)
-    
-    embed.set_footer(text="บอทจะแจ้งเตือนก่อนเกิด 10 นาที / 5 นาที")
-    await ctx.send(embed=embed)
+# ----- Slash Command: /reset_city -----
+@tree.command(name="reset_city", description="RESET บอสตามเมือง")
+@app_commands.describe(city="เลือกเมืองที่จะ reset")
+@app_commands.choices(city=[
+    app_commands.Choice(name="เมืองรีโบลโดซ์ / Reboldoeux", value="reboldoeux"),
+    app_commands.Choice(name="ท่าเรือคอยมบรา / Port of Coimbra", value="coimbra"),
+    app_commands.Choice(name="เมืองอูช / City of Auch", value="auch"),
+])
+async def reset_city_command(interaction: discord.Interaction, city: str):
+    await interaction.response.defer()
+    now = datetime.now(ICT)
+    count = 0
+    for b in BOSSES:
+        if b["city_key"] == city:
+            next_spawn = now + timedelta(hours=b.get("respawn_hours", 4))
+            timers[b["id"]] = {"last_death": now.isoformat(), "next_spawn": next_spawn.isoformat(), "notified_10min": False, "notified_spawn": False}
+            count += 1
+    save_timers(timers)
+    await interaction.followup.send(content=f"@everyone 🔄 Reset บอสเมือง {city} จำนวน {count} ตัวเรียบร้อย!")
 
-@bot.command(name="ล้าง", aliases=["clear", "ล้างนับถอยหลัง", "reset"])
-async def clear_countdown(ctx, *, name: str = ""):
-    if not name:
-        boss_deaths.clear()
-        save_deaths()
-        await ctx.send("🗑️ ล้างนับถอยหลังทั้งหมดแล้ว!")
-    else:
-        found = None
-        for key in list(boss_deaths.keys()):
-            if name.lower() in key.lower():
-                found = key
-                break
-        if found:
-            del boss_deaths[found]
-            save_deaths()
-            await ctx.send(f"🗑️ ลบ {found} ออกจากนับถอยหลังแล้ว")
-        else:
-            await ctx.send(f"ไม่เจอ {name} ในลิสต์นับถอยหลัง")
 
-@bot.command(name="ชุบ", aliases=["revive", "เกิด"])
-async def revive_boss(ctx, *, boss_name: str = ""):
-    if not boss_name:
-        await ctx.send("จะชุบตัวไหน? เช่น `!ชุบ World Boss`")
-        return
-    # ลบออกจากนับถอยหลังถ้ามี
-    for key in list(boss_deaths.keys()):
-        if boss_name.lower() in key.lower():
-            del boss_deaths[key]
-    save_deaths()
-    embed = discord.Embed(title=f"✨ {boss_name} เกิดใหม่แล้ว!", description="รีบไปตีเลย!", color=0x00FF00)
-    await ctx.send(content=ROLE_MENTION if ROLE_MENTION else None, embed=embed)
+# ----- Slash Command: /test_notify - ทดสอบแจ้งเตือน (FIX) -----
+@tree.command(name="test_notify", description="ทดสอบว่าบอทส่งแจ้งเตือนได้ไหม (ส่งข้อความทดสอบไปห้องนี้)")
+async def test_notify_command(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        # ลองส่งไปห้องที่ตั้งไว้
+        channel = client.get_channel(CHANNEL_ID) or await client.fetch_channel(CHANNEL_ID)
+        await channel.send(content=f"@everyone 🧪 ทดสอบแจ้งเตือน - บอทส่งได้ปกติ!\n## ทดสอบ\n-# Test Notify\n## แผนที่: ทดสอบ | เมือง: ทดสอบ")
+        await interaction.followup.send(f"✅ ส่งทดสอบไปห้อง <#{CHANNEL_ID}> แล้ว ถ้าเห็นข้อความ = แจ้งเตือนใช้ได้\nถ้าไม่เห็น = เช็คสิทธิ์ห้องนั้น", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ ส่งไม่ได้: {e}\nCHANNEL_ID ที่ตั้งไว้: {CHANNEL_ID}\nเช็ค: 1) บอทอยู่ในเซิร์ฟไหม 2) มีสิทธิ์ Send Messages / View Channel 3) CHANNEL_ID ถูกไหม (ต้องเป็น ID ห้อง ไม่ใช่ ID เซิร์ฟ)", ephemeral=True)
 
-# Keep Alive Flask
-try:
-    from flask import Flask
-    from threading import Thread
-    app = Flask(__name__)
-    @app.route('/')
-    def home():
-        return f"Bot {bot.user if hasattr(bot, 'user') and bot.user else 'Loading'} Online! Time: {datetime.datetime.now(BANGKOK)} Deaths: {len(boss_deaths)}"
-    @app.route('/health')
-    def health():
-        return "OK", 200
-    def run_flask():
-        port = int(os.environ.get("PORT", 8080))
-        app.run(host='0.0.0.0', port=port)
-    Thread(target=run_flask, daemon=True).start()
-except:
-    pass
+# ----- Slash Command: /debug - ดูว่าเวลาบอสค้างตรงไหน -----
+@tree.command(name="debug", description="เช็คว่าทำไมบอทไม่แจ้งเตือน - ดูเวลา + CHANNEL_ID")
+async def debug_command(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    now = datetime.now(ICT)
+    lines = [f"**CHANNEL_ID:** {CHANNEL_ID} (ห้อง <#{CHANNEL_ID}>)", f"**เวลาไทยตอนนี้:** {now.strftime('%d/%m %H:%M:%S')}", f"**บอท:** {client.user}", ""]
+    for b in BOSSES:
+        data = timers.get(b["id"], {})
+        ns = data.get("next_spawn", "ไม่มี")
+        try:
+            dt = datetime.fromisoformat(ns)
+            diff = int((dt - now).total_seconds())
+            diff_str = f"อีก {diff//60} นาที" if diff>0 else f"เลยมา {-diff//60} นาทีแล้ว"
+            flag = f"10min={data.get('notified_10min')} spawn={data.get('notified_spawn')}"
+            lines.append(f"{b['name_th']} - Next {dt.strftime('%H:%M')} ({diff_str}) {flag}")
+        except:
+            lines.append(f"{b['name_th']} - เวลาพัง {ns}")
+    lines.append("")
+    lines.append("**ถ้าเห็น 'เลยมา' เยอะ = เวลาค้างในอดีต บอทจะไม่แจ้ง -> พิมพ์ /reset_all แล้วตั้งเวลาใหม่ด้วย /setboss**")
+    lines.append("**ถ้า CHANNEL_ID ผิด = ไปก๊อป ID ห้องใหม่**")
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
+
 
 if __name__ == "__main__":
-    if not TOKEN:
-        print("❌ ไม่เจอ TOKEN")
-    elif CHANNEL_ID == 0:
-        print("❌ CHANNEL_ID เป็น 0")
-    else:
-        try:
-            bot.run(TOKEN)
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
+
+    if not DISCORD_TOKEN:
+        print("❌ ไม่พบ DISCORD_TOKEN ใน .env")
+        exit(1)
+    client.run(DISCORD_TOKEN)

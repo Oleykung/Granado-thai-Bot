@@ -3,4 +3,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
-CMD ["python", "bot.py"]
+# Render/Railway uses PORT env
+ENV PYTHONUNBUFFERED=1
+ENV WEB_PORT=10000
+CMD python main.py
