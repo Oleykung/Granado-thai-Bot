@@ -96,37 +96,31 @@ async def on_ready():
     print(f"Logged in as {client.user}")
     # Sync commands
     if GUILD_ID:
-        guild = discord.Object(id=int(GUILD_ID))
-        tree.copy_global_to(guild=guild)
-        await tree.sync(guild=guild)
-        print(f"Synced to guild {GUILD_ID}")
+        try:
+            guild = discord.Object(id=int(GUILD_ID))
+            tree.copy_global_to(guild=guild)
+            await tree.sync(guild=guild)
+            print(f"✅ Synced to guild {GUILD_ID} - คำสั่ง /boss /boss_check จะขึ้นทันที")
+        except Exception as e:
+            print(f"❌ Sync guild {GUILD_ID} ล้มเหลว: {e} - เช็คว่า GUILD_ID ถูกไหม")
+            await tree.sync()
+            print("Synced global instead")
     else:
         await tree.sync()
-        print("Synced global commands")
+        print("✅ Synced global commands - รอ 5-60 นาที คำสั่งจะขึ้น")
     if not boss_check_loop.is_running():
         boss_check_loop.start()
 
 # ----- Background Task: แจ้งเตือน 10 นาที + ตอนเกิด @everyone -----
-# ----- Background Task: แจ้งเตือน 10 นาที + ตอนเกิด @everyone (FIXED v2) -----
 @tasks.loop(seconds=30)
 async def boss_check_loop():
-    # FIX 1: โหลด timers จากไฟล์ใหม่ทุกครั้ง (กันเว็บกับบอทไม่ตรงกัน)
-    global timers
-    try:
-        timers = load_timers()
-    except Exception as e:
-        print(f"[LOOP] load timers error: {e}")
-        return
-
     if CHANNEL_ID == 0:
-        print("[LOOP] ❌ CHANNEL_ID = 0 ยังไม่ได้ตั้งค่าใน .env ! ไปเช็ค .env")
         return
     channel = client.get_channel(CHANNEL_ID)
     if not channel:
         try:
             channel = await client.fetch_channel(CHANNEL_ID)
-        except Exception as e:
-            print(f"[LOOP] ❌ หาห้อง CHANNEL_ID={CHANNEL_ID} ไม่เจอ: {e} - บอทอยู่ในเซิร์ฟนั้นไหม? มีสิทธิ์ View Channel ไหม?")
+        except:
             return
     now = datetime.now(ICT)
     updated = False
@@ -135,71 +129,46 @@ async def boss_check_loop():
         data = timers.get(bid)
         if not data:
             continue
-        try:
-            next_spawn = datetime.fromisoformat(data["next_spawn"])
-        except:
-            continue
+        next_spawn = datetime.fromisoformat(data["next_spawn"])
         diff = (next_spawn - now).total_seconds()
-
-        # FIX 2: ขยายหน้าต่างแจ้งเกิดจาก 60 วินาที -> 30 นาที
-        # ของเก่า: -60 < diff <= 0 ถ้าบอทหลับไป 61 วิ จะไม่แจ้งเลยตลอดกาล
-        # ของใหม่: -1800 < diff <= 0 (ถ้าเลยเวลาเกิดมาไม่เกิน 30 นาที ยังแจ้ง)
-        # ถ้าเลย 30 นาทีไปแล้ว = พลาดแจ้ง ให้รีเซ็ต flag เพื่อรอบหน้าแจ้งได้
 
         # 10 นาทีล่วงหน้า
         if 0 < diff <= 600 and not data.get("notified_10min"):
-            try:
-                embed = discord.Embed(
-                    title=f"⚠️ บอสใกล้เกิดใน 10 นาที!",
-                    description=format_boss_big(boss),
-                    color=0xFFAA00
-                )
-                embed.add_field(name="เวลาเกิด", value=f"<t:{int(next_spawn.timestamp())}:F> (<t:{int(next_spawn.timestamp())}:R>)", inline=False)
-                ansi_text = format_boss_ansi(boss, "- จะเกิดใน 10 นาที")
-                await channel.send(content=f"@everyone\n{ansi_text}", embed=embed)
-                print(f"[NOTIFY] 10min {boss['name_th']} diff={int(diff)}s")
-                data["notified_10min"] = True
-                updated = True
-            except Exception as e:
-                print(f"[NOTIFY ERROR] 10min {boss['name_th']}: {e} - เช็คสิทธิ์ Send Messages / Embed Links / Mention @everyone")
+            embed = discord.Embed(
+                title=f"⚠️ บอสใกล้เกิดใน 10 นาที!",
+                description=format_boss_big(boss),
+                color=0xFFAA00
+            )
+            embed.add_field(name="เวลาเกิด", value=f"<t:{int(next_spawn.timestamp())}:F> (<t:{int(next_spawn.timestamp())}:R>)", inline=False)
+            ansi_text = format_boss_ansi(boss, "- จะเกิดใน 10 นาที")
+            await channel.send(content=f"@everyone\n{ansi_text}", embed=embed)
+            data["notified_10min"] = True
+            updated = True
 
-        # ตอนเกิด - หน้าต่างกว้าง 30 นาที
-        if -1800 < diff <= 0 and not data.get("notified_spawn"):
-            try:
-                embed = discord.Embed(
-                    title=f"🔥 บอสเกิดแล้ว!",
-                    description=format_boss_big(boss),
-                    color=0xFF0000
-                )
-                embed.add_field(name="แผนที่", value=f"{boss['map_th']} ({boss['map_en']})", inline=True)
-                embed.add_field(name="เมือง", value=f"{boss['city_th']} ({boss['city_en']})", inline=True)
-                embed.add_field(name="เวลา", value=f"<t:{int(now.timestamp())}:F>", inline=False)
-                ansi_text = format_boss_ansi(boss, "- เกิดแล้ว NOW!")
-                await channel.send(content=f"@everyone บอสเกิดแล้ว!\n{ansi_text}", embed=embed)
-                print(f"[NOTIFY] SPAWN {boss['name_th']} diff={int(diff)}s")
-                data["notified_spawn"] = True
-                updated = True
-            except Exception as e:
-                print(f"[NOTIFY ERROR] SPAWN {boss['name_th']}: {e}")
+        # ตอนเกิด
+        if -60 < diff <= 0 and not data.get("notified_spawn"):
+            embed = discord.Embed(
+                title=f"🔥 บอสเกิดแล้ว!",
+                description=format_boss_big(boss),
+                color=0xFF0000
+            )
+            embed.add_field(name="แผนที่", value=f"{boss['map_th']} ({boss['map_en']})", inline=True)
+            embed.add_field(name="เมือง", value=f"{boss['city_th']} ({boss['city_en']})", inline=True)
+            embed.add_field(name="เวลา", value=f"<t:{int(now.timestamp())}:F>", inline=False)
+            ansi_text = format_boss_ansi(boss, "- เกิดแล้ว NOW!")
+            await channel.send(content=f"@everyone บอสเกิดแล้ว!\n{ansi_text}", embed=embed)
+            data["notified_spawn"] = True
+            # หลังแจ้งเกิด ให้ตั้งเวลารอบใหม่? จะไม่ตั้งจนกว่าจะ kill
+            # แต่ถ้าเป็นบอสแบบ fixed time ให้รีเซ็ตเอง
+            updated = True
 
-        # FIX 3: ถ้าเลยเวลาเกิดไปแล้วเกิน 30 นาที ยังไม่มี kill -> อย่าค้าง flag
-        # ของเก่า pass เฉยๆ ทำให้ next_spawn ในอดีตค้างตลอด บอทจะไม่แจ้งอีกเลย
-        if diff < -1800:
-            # ถ้าเลยมา 30 นาทีแล้ว แปลว่าพลาดแจ้งไปแล้ว ให้รีเซ็ต flag เพื่อไม่ให้ค้าง
-            # และอย่าเพิ่งรีเซ็ตเวลา รอ /kill (แต่จะ log ไว้)
-            if data.get("notified_spawn") or data.get("notified_10min"):
-                print(f"[LOOP] Missed {boss['name_th']} diff={int(diff)}s next={next_spawn} - รอ /kill หรือ /reset_all")
-            # ไม่รีเซ็ตอัตโนมัติ แต่ปลด flag ให้รอบหน้าถ้ามีการ set ใหม่จะแจ้งได้
+        # ถ้าเลยเวลาเกิดไปแล้ว 5 นาที ยังไม่มี kill ให้รีเซ็ต notified_spawn เพื่อไม่สแปม
+        if diff < -300 and data.get("notified_spawn"):
+            # ไม่รีเซ็ตเวลา รอ kill command
             pass
 
     if updated:
         save_timers(timers)
-
-@boss_check_loop.before_loop
-async def before_boss_loop():
-    await client.wait_until_ready()
-    print("[LOOP] boss_check_loop ready - เริ่มเช็คทุก 30 วิ")
-
 
 # ----- Autocomplete -----
 async def boss_autocomplete(interaction: discord.Interaction, current: str):
@@ -210,7 +179,7 @@ async def boss_autocomplete(interaction: discord.Interaction, current: str):
             choices.append(app_commands.Choice(name=f"{b['name_th']} / {b['name_en']}", value=b["id"]))
     return choices[:25]
 
-# ----- Slash Command: /boss -----
+# ----- Slash Command: /boss (FIXED v3 - กันแอปไม่ตอบสนอง) -----
 @tree.command(name="boss", description="เช็คเวลาบอส Granado Espada M ทั้ง 12 ตัว")
 @app_commands.describe(city="กรองตามเมือง: reboldoeux / coimbra / auch")
 @app_commands.choices(city=[
@@ -219,58 +188,100 @@ async def boss_autocomplete(interaction: discord.Interaction, current: str):
     app_commands.Choice(name="เมืองอูช / City of Auch", value="auch"),
 ])
 async def boss_command(interaction: discord.Interaction, city: str = None):
-    await interaction.response.defer()
-    now = datetime.now(ICT)
-    filtered = BOSSES
-    if city:
-        filtered = [b for b in BOSSES if b["city_key"] == city]
+    # FIX: defer ทันที กัน timeout 3 วิ
+    try:
+        await interaction.response.defer(ephemeral=False)
+    except:
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except:
+            pass
+    try:
+        now = datetime.now(ICT)
+        filtered = BOSSES
+        if city:
+            filtered = [b for b in BOSSES if b["city_key"] == city]
 
-    embed = discord.Embed(
-        title="📜 ตารางบอส Granado Espada M - เซิร์ฟไทย",
-        description="ไทยตัวใหญ่ ## / อังกฤษตัวเล็ก -# | แดง=ไทย เหลือง=อังกฤษ ใน ANSI",
-        color=0x00FFAA
-    )
+        # FIX: โหลด timers ใหม่ทุกครั้งกันไฟล์เก่า
+        try:
+            current_timers = load_timers()
+        except:
+            current_timers = timers
 
-    lines = []
-    ansi_blocks = []
-    for b in filtered:
-        bid = b["id"]
-        next_spawn = get_next_spawn(bid)
-        if next_spawn:
-            ts = f"<t:{int(next_spawn.timestamp())}:R> (<t:{int(next_spawn.timestamp())}:t>)"
-            remaining = next_spawn - now
-            status = f"⏰ {ts}"
-        else:
-            status = "ไม่พบเวลา"
-        
-        # Embed field แบบที่ขอ ## ไทยใหญ่ -# อังกฤษเล็ก
-        embed.add_field(
-            name=f"{b['name_th']} / {b['name_en']}",
-            value=f"## {b['name_th']}\n-# {b['name_en']}\n## {b['map_th']} | {b['city_th']}\n-# {b['map_en']} | {b['city_en']}\n{status}\n",
-            inline=False
+        embed = discord.Embed(
+            title="📜 ตารางบอส Granado Espada M - เซิร์ฟไทย",
+            description=f"ทั้งหมด {len(filtered)} ตัว | ไทย ## แดง / อังกฤษ -# เหลือง | เวลาไทย ICT",
+            color=0x00FFAA
         )
-        # สำหรับแสดงในข้อความหลักด้วย
-        lines.append(f"## {b['name_th']}\n-# {b['name_en']} - {status}")
 
-    # ส่งเป็น embed + ANSI ตัวอย่าง 3 ตัวแรก
-    ansi_example = ""
-    for b in filtered[:3]:
-        ansi_example += format_boss_ansi(b) + "\n"
+        lines = []
+        for b in filtered[:12]:
+            bid = b["id"]
+            t = current_timers.get(bid, {})
+            ns_str = t.get("next_spawn")
+            if ns_str:
+                try:
+                    next_spawn = datetime.fromisoformat(ns_str)
+                    ts = f"<t:{int(next_spawn.timestamp())}:R>"
+                    status = f"⏰ {ts} (<t:{int(next_spawn.timestamp())}:t>)"
+                except:
+                    status = "เวลาพัง"
+            else:
+                status = "ยังไม่มีเวลา / พิมพ์ /reset_all"
 
-    content = "@everyone\n" + "\n".join(lines[:12]) + f"\n\n{ansi_example}\n**สีแดง=ไทย / สีเหลือง=อังกฤษ** ใช้ /kill เพื่อรีเซ็ตเวลาเมื่อบอสตาย"
+            # ย่อ field ไม่ให้เกิน 1024 ตัวอักษร (สาเหตุหลักที่ทำให้บอท error)
+            field_value = f"## {b['name_th']}\n-# {b['name_en']}\n{status}\n"
+            if len(field_value) > 900:
+                field_value = field_value[:900]
 
-    # Discord จำกัดความยาว ถ้าเยอะให้ส่งเป็น embed อย่างเดียว
-    if len(content) > 1900:
-        content = "@everyone ตารางบอสทั้งหมดใน Embed ด้านล่าง"
-    
-    await interaction.followup.send(content=content, embed=embed)
+            embed.add_field(
+                name=f"{b['name_th']}",
+                value=field_value,
+                inline=False
+            )
+            lines.append(f"## {b['name_th']} - {status}")
+
+        # content สั้นๆ กันเกิน 2000 ตัวอักษร
+        content_text = "\n".join(lines[:6])
+        if len(filtered) > 6:
+            content_text += f"\n...และอีก {len(filtered)-6} ตัว ดูใน Embed ด้านล่าง"
+        if len(content_text) > 1800:
+            content_text = content_text[:1800]
+
+        await interaction.followup.send(content=content_text, embed=embed)
+    except Exception as e:
+        print(f"[BOSS CMD ERROR] {e}")
+        import traceback
+        traceback.print_exc()
+        try:
+            await interaction.followup.send(f"❌ เกิดข้อผิดพลาด: {e}\nลองพิมพ์ /debug เพื่อเช็คเวลา หรือ /reset_all เพื่อรีเซ็ต", ephemeral=True)
+        except:
+            try:
+                await interaction.channel.send(f"❌ /boss error: {e}")
+            except:
+                pass
+
+# ----- Alias: /boss_check (ของเก่าที่คุณใช้) -----
+@tree.command(name="boss_check", description="เช็คเวลาบอส (ชื่อเก่า) - ใช้เหมือน /boss")
+@app_commands.describe(city="กรองตามเมือง: reboldoeux / coimbra / auch")
+@app_commands.choices(city=[
+    app_commands.Choice(name="เมืองรีโบลโดซ์ / Reboldoeux", value="reboldoeux"),
+    app_commands.Choice(name="ท่าเรือคอยมบรา / Port of Coimbra", value="coimbra"),
+    app_commands.Choice(name="เมืองอูช / City of Auch", value="auch"),
+])
+async def boss_check_command(interaction: discord.Interaction, city: str = None):
+    # เรียกใช้ logic เดียวกับ /boss เลย
+    await boss_command(interaction, city)
 
 # ----- Slash Command: /kill -----
 @tree.command(name="kill", description="แจ้งว่าบอสตายแล้ว เพื่อรีเซ็ตเวลาเกิดใหม่ (kill boss)")
 @app_commands.describe(boss="เลือกบอสที่ตาย")
 @app_commands.autocomplete(boss=boss_autocomplete)
 async def kill_command(interaction: discord.Interaction, boss: str):
-    await interaction.response.defer()
+    try:
+        await interaction.response.defer()
+    except:
+        pass
     if boss not in BOSSES_BY_ID:
         await interaction.followup.send(f"❌ ไม่พบบอส id `{boss}`", ephemeral=True)
         return
@@ -357,7 +368,10 @@ async def boss_web_command(interaction: discord.Interaction):
 # ----- Slash Command: /reset_all -----
 @tree.command(name="reset_all", description="RESET บอสทุกตัว (12 ตัว) - ตั้งเวลาเกิดใหม่ทั้งหมด")
 async def reset_all_command(interaction: discord.Interaction):
-    await interaction.response.defer()
+    try:
+        await interaction.response.defer()
+    except:
+        pass
     now = datetime.now(ICT)
     for b in BOSSES:
         next_spawn = now + timedelta(hours=b.get("respawn_hours", 4))
@@ -383,7 +397,10 @@ async def reset_all_command(interaction: discord.Interaction):
     app_commands.Choice(name="เมืองอูช / City of Auch", value="auch"),
 ])
 async def reset_city_command(interaction: discord.Interaction, city: str):
-    await interaction.response.defer()
+    try:
+        await interaction.response.defer()
+    except:
+        pass
     now = datetime.now(ICT)
     count = 0
     for b in BOSSES:
@@ -393,42 +410,6 @@ async def reset_city_command(interaction: discord.Interaction, city: str):
             count += 1
     save_timers(timers)
     await interaction.followup.send(content=f"@everyone 🔄 Reset บอสเมือง {city} จำนวน {count} ตัวเรียบร้อย!")
-
-
-# ----- Slash Command: /test_notify - ทดสอบแจ้งเตือน (FIX) -----
-@tree.command(name="test_notify", description="ทดสอบว่าบอทส่งแจ้งเตือนได้ไหม (ส่งข้อความทดสอบไปห้องนี้)")
-async def test_notify_command(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    try:
-        # ลองส่งไปห้องที่ตั้งไว้
-        channel = client.get_channel(CHANNEL_ID) or await client.fetch_channel(CHANNEL_ID)
-        await channel.send(content=f"@everyone 🧪 ทดสอบแจ้งเตือน - บอทส่งได้ปกติ!\n## ทดสอบ\n-# Test Notify\n## แผนที่: ทดสอบ | เมือง: ทดสอบ")
-        await interaction.followup.send(f"✅ ส่งทดสอบไปห้อง <#{CHANNEL_ID}> แล้ว ถ้าเห็นข้อความ = แจ้งเตือนใช้ได้\nถ้าไม่เห็น = เช็คสิทธิ์ห้องนั้น", ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send(f"❌ ส่งไม่ได้: {e}\nCHANNEL_ID ที่ตั้งไว้: {CHANNEL_ID}\nเช็ค: 1) บอทอยู่ในเซิร์ฟไหม 2) มีสิทธิ์ Send Messages / View Channel 3) CHANNEL_ID ถูกไหม (ต้องเป็น ID ห้อง ไม่ใช่ ID เซิร์ฟ)", ephemeral=True)
-
-# ----- Slash Command: /debug - ดูว่าเวลาบอสค้างตรงไหน -----
-@tree.command(name="debug", description="เช็คว่าทำไมบอทไม่แจ้งเตือน - ดูเวลา + CHANNEL_ID")
-async def debug_command(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    now = datetime.now(ICT)
-    lines = [f"**CHANNEL_ID:** {CHANNEL_ID} (ห้อง <#{CHANNEL_ID}>)", f"**เวลาไทยตอนนี้:** {now.strftime('%d/%m %H:%M:%S')}", f"**บอท:** {client.user}", ""]
-    for b in BOSSES:
-        data = timers.get(b["id"], {})
-        ns = data.get("next_spawn", "ไม่มี")
-        try:
-            dt = datetime.fromisoformat(ns)
-            diff = int((dt - now).total_seconds())
-            diff_str = f"อีก {diff//60} นาที" if diff>0 else f"เลยมา {-diff//60} นาทีแล้ว"
-            flag = f"10min={data.get('notified_10min')} spawn={data.get('notified_spawn')}"
-            lines.append(f"{b['name_th']} - Next {dt.strftime('%H:%M')} ({diff_str}) {flag}")
-        except:
-            lines.append(f"{b['name_th']} - เวลาพัง {ns}")
-    lines.append("")
-    lines.append("**ถ้าเห็น 'เลยมา' เยอะ = เวลาค้างในอดีต บอทจะไม่แจ้ง -> พิมพ์ /reset_all แล้วตั้งเวลาใหม่ด้วย /setboss**")
-    lines.append("**ถ้า CHANNEL_ID ผิด = ไปก๊อป ID ห้องใหม่**")
-    await interaction.followup.send("\n".join(lines), ephemeral=True)
-
 
 if __name__ == "__main__":
 
